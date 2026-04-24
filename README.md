@@ -1,6 +1,6 @@
 # Multi-Currency E-Wallet Backend
 
-A ledger-based, multi-currency E-Wallet backend system built with **Express.js** and **PostgreSQL**. Features safe decimal arithmetic, ACID transactions, idempotent operations, and comprehensive edge case handling.
+A ledger-based, multi-currency E-Wallet backend built with **Express.js**, **PostgreSQL**, and **Knex**. Features safe decimal arithmetic, ACID transactions, idempotent operations, versioned migrations, and interactive API docs via Swagger UI.
 
 ---
 
@@ -12,7 +12,8 @@ A ledger-based, multi-currency E-Wallet backend system built with **Express.js**
 - [Running the Server](#running-the-server)
 - [Running Tests](#running-tests)
 - [API Documentation](#api-documentation)
-- [Design Decisions & Assumptions](#design-decisions--assumptions)
+- [Endpoints](#endpoints)
+- [Design Decisions](#design-decisions)
 - [Edge Case Handling](#edge-case-handling)
 
 ---
@@ -22,31 +23,39 @@ A ledger-based, multi-currency E-Wallet backend system built with **Express.js**
 ```
 src/
 ├── app.js                    # Express app factory
-├── server.js                 # Entry point with graceful shutdown
-├── config/database.js        # PostgreSQL pool + schema init
+├── server.js                 # Entry point, runs migrations, graceful shutdown
+├── config/
+│   ├── database.js           # Knex instance factory
+│   └── swagger.js            # OpenAPI 3.0 spec (swagger-jsdoc)
 ├── middleware/
 │   ├── errorHandler.js       # Global error → JSON response mapper
 │   ├── validateRequest.js    # express-validator chains per route
 │   └── idempotency.js        # Idempotency-Key dedup middleware
 ├── models/
-│   ├── wallet.js             # Wallet CRUD + FOR UPDATE locking
-│   └── ledger.js             # Append-only ledger + balance computation
+│   ├── wallet.js             # Wallet queries (Knex builder + FOR UPDATE)
+│   └── ledger.js             # Append-only ledger, pagination, balance computation
 ├── services/
-│   └── walletService.js      # All business logic + transactions
+│   └── walletService.js      # Business logic inside knex.transaction()
 ├── routes/
-│   └── walletRoutes.js       # Route definitions
+│   └── walletRoutes.js       # Route definitions + @openapi JSDoc annotations
 └── utils/
-    ├── decimal.js            # Safe decimal math (decimal.js)
-    ├── errors.js             # Custom error classes
-    └── constants.js          # Enums (status, ledger types, currencies)
+    ├── decimal.js            # Safe decimal math (decimal.js, ROUND_HALF_UP)
+    ├── errors.js             # Custom AppError subclasses
+    └── constants.js          # Enums: status, ledger types, supported currencies
+
+migrations/
+├── 20260424000001_create_wallets.js
+├── 20260424000002_create_ledger.js
+├── 20260424000003_create_idempotency_keys.js
+└── 20260424000004_create_indexes.js
 ```
 
 ---
 
 ## Prerequisites
 
-- **Node.js** ≥ 18
-- **PostgreSQL** ≥ 13
+- **Node.js** >= 18
+- **PostgreSQL** >= 13
 
 ---
 
@@ -55,7 +64,7 @@ src/
 ### 1. Clone and install dependencies
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/AnandaBintang/e-wallet.git
 cd e-wallet
 npm install
 ```
@@ -76,6 +85,7 @@ DB_NAME=ewallet
 DB_USER=postgres
 DB_PASSWORD=postgres
 DB_NAME_TEST=ewallet_test
+DB_POOL_MAX=20
 PORT=3000
 NODE_ENV=development
 ```
@@ -83,14 +93,21 @@ NODE_ENV=development
 ### 3. Create databases
 
 ```bash
-# Main database
 createdb ewallet
-
-# Test database
 createdb ewallet_test
 ```
 
-> **Note**: Tables are created automatically on first run via `initializeDatabase()`.
+### 4. Run migrations
+
+```bash
+npm run migrate
+```
+
+Migrations are versioned files tracked in a `knex_migrations` table. To roll back:
+
+```bash
+npm run migrate:down
+```
 
 ---
 
@@ -102,13 +119,12 @@ npm start
 npm run dev
 ```
 
-Output:
+On startup, migrations are applied automatically (`knex.migrate.latest()`).
 
 ```
-Database schema initialized
-E-Wallet server running on http://localhost:3000
-Health check: http://localhost:3000/health
-API base: http://localhost:3000/api/wallets
+Database migrations up to date
+Server running on http://localhost:3000
+API Docs: http://localhost:3000/api-docs
 ```
 
 ---
@@ -126,34 +142,94 @@ npm run test:verbose
 npm run test:coverage
 ```
 
-> Tests use the `ewallet_test` database. Make sure it exists before running.
+Tests connect to `ewallet_test`, run all migrations fresh in `beforeAll`, and roll back in `afterAll`. Make sure the database exists:
+
+```bash
+createdb ewallet_test
+```
 
 ---
 
 ## API Documentation
 
-### Base URL: `http://localhost:3000/api`
+### Interactive Swagger UI
 
-All responses follow the format:
+The full API is documented with OpenAPI 3.0 and served interactively via Swagger UI.
+
+| Resource | URL |
+|---|---|
+| Swagger UI | http://localhost:3000/api-docs |
+| Raw OpenAPI JSON | http://localhost:3000/api-docs.json |
+| Health check | http://localhost:3000/health |
+
+Open **http://localhost:3000/api-docs** in your browser to browse all endpoints, view request/response schemas, and try requests directly from the browser.
+
+### Response format
+
+All endpoints return a consistent envelope:
 
 ```json
 {
-  "success": true|false,
-  "data": { ... },        // on success
-  "error": {              // on failure
-    "code": "ERROR_CODE",
-    "message": "..."
+  "success": true,
+  "data": { }
+}
+```
+
+On error:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "WALLET_NOT_FOUND",
+    "message": "Wallet not found: abc-123"
   }
 }
 ```
 
 ### Idempotency
 
-All mutating endpoints support the `Idempotency-Key` header. Send the same key to safely retry requests without double-processing.
+All mutating endpoints support the `Idempotency-Key` header. Sending the same key on a retry returns the cached response without re-executing the operation.
+
+```bash
+curl -X POST http://localhost:3000/api/wallets/{id}/topup \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: topup-user1-2026-04-24-001" \
+  -d '{"amount": "100.00"}'
+```
 
 ---
 
-### 1. Create Wallet
+## Endpoints
+
+### Wallets
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/wallets` | Create a wallet |
+| `GET` | `/api/wallets/:id` | Get wallet balance and status |
+| `POST` | `/api/wallets/:id/suspend` | Suspend a wallet |
+| `GET` | `/api/wallets/owner/:ownerId` | List all wallets for a user |
+
+### Transactions
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/wallets/:id/topup` | Add funds to a wallet |
+| `POST` | `/api/wallets/:id/pay` | Deduct funds from a wallet |
+| `POST` | `/api/wallets/transfer` | Transfer funds between wallets (same currency) |
+
+### Ledger
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/wallets/:id/ledger` | Get paginated ledger entries (`?page=1&limit=50`) |
+
+---
+
+### Quick examples
+
+**Create wallet**
 
 ```bash
 curl -X POST http://localhost:3000/api/wallets \
@@ -161,42 +237,24 @@ curl -X POST http://localhost:3000/api/wallets \
   -d '{"owner_id": "user1", "currency": "USD"}'
 ```
 
-**Response** (201):
-
-```json
-{
-  "success": true,
-  "data": {
-    "wallet_id": "a1b2c3d4-...",
-    "owner_id": "user1",
-    "currency": "USD",
-    "balance": "0.00",
-    "status": "ACTIVE",
-    "created_at": "2026-04-24T...",
-    "updated_at": "2026-04-24T..."
-  }
-}
-```
-
-### 2. Top-Up
+**Top-up**
 
 ```bash
 curl -X POST http://localhost:3000/api/wallets/{wallet_id}/topup \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: topup-001" \
-  -d '{"amount": "1000.50"}'
+  -d '{"amount": "1000.50", "description": "Monthly salary"}'
 ```
 
-### 3. Payment
+**Payment**
 
 ```bash
 curl -X POST http://localhost:3000/api/wallets/{wallet_id}/pay \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: pay-001" \
-  -d '{"amount": "200.10"}'
+  -d '{"amount": "49.99", "description": "Netflix"}'
 ```
 
-### 4. Transfer
+**Transfer**
 
 ```bash
 curl -X POST http://localhost:3000/api/wallets/transfer \
@@ -209,94 +267,82 @@ curl -X POST http://localhost:3000/api/wallets/transfer \
   }'
 ```
 
-### 5. Suspend Wallet
-
-```bash
-curl -X POST http://localhost:3000/api/wallets/{wallet_id}/suspend
-```
-
-### 6. Get Wallet Status
+**Get wallet** (includes ledger integrity check)
 
 ```bash
 curl http://localhost:3000/api/wallets/{wallet_id}
 ```
 
-**Response** includes `ledger_consistent: true|false` — verifying that the balance matches the sum of all ledger entries.
-
-### 7. Get Wallet Ledger
+**Get ledger** (paginated)
 
 ```bash
-curl http://localhost:3000/api/wallets/{wallet_id}/ledger
-```
-
-### 8. List User's Wallets
-
-```bash
-curl http://localhost:3000/api/wallets/owner/{owner_id}
-```
-
-### 9. Health Check
-
-```bash
-curl http://localhost:3000/health
+curl "http://localhost:3000/api/wallets/{wallet_id}/ledger?page=1&limit=50"
 ```
 
 ---
 
-## Design Decisions & Assumptions
+## Design Decisions
 
-### Money Handling
+### Money handling
 
-- All monetary values use `decimal.js` — **never native JavaScript floats**
-- Amounts are rounded to **2 decimal places** using **ROUND_HALF_UP** (banker's convention)
-- Stored as `NUMERIC(20,2)` in PostgreSQL (exact decimal, up to 999,999,999,999,999,999.99)
+- All arithmetic uses `decimal.js` — never native JavaScript floats
+- Amounts rounded to **2 decimal places** (ROUND_HALF_UP)
+- Stored as `NUMERIC(20,2)` in PostgreSQL — exact decimal up to 999,999,999,999,999,999.99
 - Minimum operation amount: **0.01**
 
-### Database
+### Migrations
 
-- **PostgreSQL** with `pg` driver and connection pooling
-- Schema auto-created via `initializeDatabase()` on startup
-- `UNIQUE(owner_id, currency)` constraint enforces one wallet per currency per user
+- Schema is managed by **Knex** migrations in `migrations/`, not inline `CREATE TABLE IF NOT EXISTS`
+- Applied automatically on server start via `knex.migrate.latest()`
+- Tracked in `knex_migrations` table — rollback supported via `npm run migrate:down`
 
-### Transactions & Concurrency
+### Query performance
 
-- All mutating operations run in PostgreSQL transactions (`BEGIN`/`COMMIT`/`ROLLBACK`)
-- `SELECT ... FOR UPDATE` acquires row-level locks to prevent double-spending
-- Transfer operations lock wallets in **sorted ID order** to prevent deadlocks
+- Composite covering index on `ledger(wallet_id, created_at, entry_id)` for paginated sorts
+- Partial index on `wallets(owner_id) WHERE status = 'ACTIVE'` for active-wallet queries
+- Filtered index on `ledger(reference_id) WHERE reference_id IS NOT NULL` for transfer lookups
+- All queries use explicit column projection — no `SELECT *`
+- Ledger uses parallel `COUNT` + `SELECT` for pagination metadata
+
+### Transactions and concurrency
+
+- All mutating operations run inside `knex.transaction()` — automatic BEGIN/COMMIT/ROLLBACK
+- `SELECT ... FOR UPDATE` via Knex's `.forUpdate()` acquires row-level locks
+- Transfer locks wallets in **sorted ID order** to prevent deadlocks
 - Concurrent operations are safe — PostgreSQL serializes conflicting writes
 
 ### Idempotency
 
-- Clients can send an `Idempotency-Key` header on mutating requests
-- Duplicate keys return the cached response without re-execution
-- Keys are persisted to PostgreSQL for durability across restarts
+- Clients send an `Idempotency-Key` header on mutating requests
+- Duplicate keys replay the original response without re-executing
+- Keys persisted to PostgreSQL for durability across server restarts
 
 ### Ledger
 
 - Append-only — entries are never updated or deleted
 - Every balance change creates a corresponding ledger entry
-- `getWallet` verifies `balance === SUM(ledger)` on every query
-- Transfer operations create two linked entries sharing a `reference_id`
+- `GET /api/wallets/:id` verifies `balance === SUM(ledger)` on every request
+- Transfer creates two linked entries sharing a `reference_id` (debit + credit)
 
-### Supported Currencies
+### Supported currencies
 
-- USD, EUR, GBP, JPY, IDR, SGD, AUD, CAD, CHF, CNY, HKD, KRW, MYR, NZD, PHP, THB, TWD, VND, INR, BRL
+USD, EUR, GBP, JPY, IDR, SGD, AUD, CAD, CHF, CNY, HKD, KRW, MYR, NZD, PHP, THB, TWD, VND, INR, BRL
 
 ---
 
 ## Edge Case Handling
 
-| Edge Case                | Handling                                           |
-| ------------------------ | -------------------------------------------------- |
-| `12.345` top-up          | Rounded to `12.35` (ROUND_HALF_UP)                 |
-| `0.001` payment          | Rejected — rounds to `0.00`, below minimum         |
-| 1 billion balance        | ✅ Supported by NUMERIC(20,2)                      |
-| Cross-currency transfer  | Rejected with `CURRENCY_MISMATCH`                  |
-| Duplicate wallet         | Rejected with `DUPLICATE_WALLET` (409)             |
-| Zero/negative amounts    | Rejected by validation                             |
-| Duplicate requests       | Idempotency-Key returns cached response            |
-| Concurrent spending      | FOR UPDATE row locks prevent overdraw              |
-| Partial transfer failure | Single transaction — atomic rollback               |
-| Balance ≠ ledger         | Detected via integrity check on `GET /wallets/:id` |
-| Suspended wallet         | All operations return `403 WALLET_SUSPENDED`       |
-| Crash recovery           | PostgreSQL WAL ensures consistency                 |
+| Edge case | Handling |
+|---|---|
+| `12.345` top-up | Rounded to `12.35` (ROUND_HALF_UP) |
+| `0.001` payment | Rejected — rounds to `0.00`, below minimum |
+| 1 billion balance | Supported by `NUMERIC(20,2)` |
+| Cross-currency transfer | Rejected with `CURRENCY_MISMATCH` (400) |
+| Duplicate wallet | Rejected with `DUPLICATE_WALLET` (409) |
+| Zero / negative amounts | Rejected by validation layer |
+| Duplicate requests | `Idempotency-Key` replays cached response |
+| Concurrent spending | `FOR UPDATE` row locks prevent overdraw |
+| Partial transfer failure | Single transaction — fully rolled back |
+| Balance mismatch | Detected via integrity check on `GET /wallets/:id` |
+| Suspended wallet | All operations return `403 WALLET_SUSPENDED` |
+| Crash recovery | PostgreSQL WAL ensures consistency |
